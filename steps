@@ -1,3 +1,243 @@
-1. To refresh the standby, ensure that managed recovery is stopped on standby:
-SQL> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+How to Roll Forward a Standby Database Using Recover Database From Service (Doc ID 2850185.1)
+
+Stop Managed Recovery and Redo Transport
+From the Primary database:
+
+SQL > alter system set log_archive_dest_state_2='defer' scope=both;
+SQL> alter system archive log current;
+
+From the Standby database:
+
+SQL> recover managed standby database cancel;
+
+Save Existing Logfile Names
+SQL> set heading off linesize 999 pagesize 0 feedback off trimspool on
+SQL> spool /tmp/delete_logfiles.log
+SQL> select member from v$logfile;
+SQL> spool off
+
+Document the Current SCN for the Standby
+
+RMAN> select current_scn from v$database;
+CURRENT_SCN#
+------------------
+10246000000000
+
+Save Current RMAN Configuration Settings
+
+On the standby:
+
+ rman target / nocatalog log=/tmp/RMAN_settings.log <<EOF
+show all;
+EOF
+
+To remove the unnecessary commands output and the RETENTION POLICY command, which cannot be executed on a standby, run the following:
+
+$ grep ^CONFIGURE /tmp/RMAN_settings.log | grep -v 'RETENTION POLICY' >/tmp/RMAN_settings.rman
+
+$ rm /tmp/RMAN_settings.log
+
+Refresh the Standby Control File
+
+Start one instance in nomount and restore the control file from the primary database. 
+
+SQL> shu immediate ;
+
+$ rman target / nocatalog
+
+RMAN> startup nomount
+
+RMAN> restore standby controlfile from service <tns alias for primary database>;
+
+RMAN> restore standby controlfile from service PR_CC;
+
+Replace RMAN Configuration Settings and Remove Orphaned Online and Standby Redo Log Files
+****************************************************************************************
+
+
+RMAN>  alter database mount;
+
+RMAN> @/tmp/RMAN_settings.rman
+
+RMAN> exit
+
+rm /tmp/RMAN_settings.rman
+
+ 
+ Catalog Standby Database Files to the Refreshed Control File
+ ***********************************************************
+
+ RMAN> catalog start with '<DATA DISKGROUP>/<standby db_unique_name/';
+
+ RMAN> catalog start with '+CCDATA01/DR_CC/';
+ RMAN> catalog start with '+CCDATA02/DR_CC/';
+ RMAN > catalog start with '+CCSYS/DR_CC/';
+
+ Restore Any Missing Files
+ *************************
+
+ select file# from v$datafile where creation_change# >= 10246000000000;
+
+ RMAN> select file# from v$datafile where creation_change# >=10246000000000;
+
+
+no rows selected
+
+Restore Missing Datatfiles
+**************************
+RMAN> run {
+allocate channel c1 type disk;
+allocate channel c2 type disk;
+allocate channel c3 type disk;
+allocate channel c4 type disk;
+allocate channel c5 type disk;
+allocate channel c6 type disk;
+allocate channel c7 type disk;
+allocate channel c8 type disk;
+set newname for database to NEW;
+restore datafile <comma separate list of files> from service <tns alias for primary database> section size <section size>;
+}
+
+
+Switch Database to Copy
+***********************
+
+
+To make the restored and pre-existing standby datafile locations permanent in the controlfile, switch to the cataloged copies of the datafiles.
+
+RMAN> switch database to copy;
+
+Clean Up Orphaned Files
+**********************
+
+
+RMAN> list datafilecopy all;
+
+RMAN> delete datafilecopy all;
+
+
+Clear Online Redo Logs and Standby Redo Logs
+********************************************
+SQL> begin
+
+for log_cur in ( select group# group_no from v$standby_log )
+loop
+execute immediate 'alter database clear logfile group '||log_cur.group_no;
+end loop;
+end;
+/
+
+
+Roll the Standby Database Forward
+*********************************
+
+The standby database is now prepared to execute the recover from service incremental roll forward.
+
+Restart All Instances to Mount
+SQL > shu immediate ;
+SQL > startup mount ;
+
+
+
+Re-Enable Redo Transport
+*************************
+
+
+via SQLPLUS From the Primary database:
+SQL> alter system set LOG_ARCHIVE_DEST_STATE_<#>=ENABLE;
+
+System altered.
+
+On the primary, query the largest datafile size to determine the section size to be used for the recover command. 
+    
+    SQL> select max(bytes)/1073741824 GB from v$datafile;
+        If the largest file is:
+
+<15TB use section size of 64GB
+>15TB and <30TB used section size of 128G
+>30TB and <60TB used section size of 256G
+>60TB use section size of 512G
+
+Run Recover From Service
+************************ 
+
+$ rman target sys/<password>  <- It is necessary to connect with the password
+
+RMAN > run {
+allocate channel c1 type disk connect '/@<standby instance 1 SID_NAME>';
+allocate channel c2 type disk connect '/@<standby instance 1 SID_NAME>';
+allocate channel c3 type disk connect '/@<standby instance 1 SID_NAME>';
+allocate channel c4 type disk connect '/@<standby instance 1 SID_NAME>';
+allocate channel c5 type disk connect '/@<standby instance 2 SID_NAME>';
+allocate channel c6 type disk connect '/@<standby instance 2 SID_NAME>';
+allocate channel c7 type disk connect '/@<standby instance 2 SID_NAME>';
+allocate channel c8 type disk connect '/@<standby instance 2 SID_NAME>';
+recover database from service '<primary unique name>' section size <section size>;
+}
+
+
+
+RMAN > run {
+allocate channel c1 type disk connect 'cc';
+allocate channel c2 type disk connect 'cc';
+allocate channel c3 type disk connect 'cc';
+allocate channel c4 type disk connect 'cc';
+allocate channel c5 type disk connect 'cc';
+allocate channel c6 type disk connect 'cc';
+allocate channel c7 type disk connect 'cc';
+allocate channel c8 type disk connect 'cc';
+recover database from service 'cc' section size 64GB ;
+}
+
+
+ 
+
+ Estimating the time which the recover will take is difficult due to the number of variables however, once started, progress and estimates can be monitored with GV$SESSION_LONGOPS on the primary database.
+
+
+ select INST_ID,SID,SERIAL#,OPNAME, (sofar/totalwork)*100 as "%complete", ELAPSED_SECONDS, TIME_REMAINING
+from gv$session_longops
+where sofar<>totalwork
+and totalwork<>0
+and SID||SERIAL# in (select SID||SERIAL# from v$session);
+
+INST_ID    SID        SERIAL#    OPNAME                                                           %complete  ELAPSED_SECONDS TIME_REMAINING
+---------- ---------- ---------- ---------------------------------------------------------------- ---------- --------------- --------------
+         1       1177      56089 RMAN: incremental datafile backup                                2.36167908              55           2274
+         1       2415      52071 RMAN: incremental datafile backup                                12.9760623             394           2642
+         1       2541      26066 RMAN: incremental datafile backup                                .274372101              22           7996
+         1       2808      18883 RMAN: incremental datafile backup                                .262057781              21           7992
+         1       2670      65170 RMAN: incremental datafile backup                                8.32093954             386           4253
+         1       1900      48392 RMAN: incremental datafile backup                                5.93750477             197           3121 
+
+
+
+
+ Recover Until Consistent
+ *************************
+
+ From the primary:
+
+ SQL> alter system archive log current;
+
+ Then from SQL*PLUS on the standby issue the command below.  The UNTIL CONSISTENT clause cannot be used in RMAN
+
+ SQL> recover automatic standby database until consistent;
+Media recovery complete.
+
+Re-Enable Flashback Database
+**************************
+
+SQL> alter database flashback on;
+
+Database altered.
+
+Restart the Standby and Managed Recovery
+***************************************
+
+SQL > shu immediate ;
+SQL > startup mount ;
+
+SQL> recover managed standby database disconnect;
+
 
